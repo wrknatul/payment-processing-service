@@ -9,22 +9,22 @@ Alembic, Docker Compose.
 ## Как это работает
 
 ```
-POST /api/v1/payments
-        │  одна транзакция
-        ▼
-  payments + outbox                    PostgreSQL
-        │
-        │  outbox-relay: SELECT ... FOR UPDATE SKIP LOCKED, publish с подтверждением брокера
-        ▼
-  exchange payments ──payments.new──▶ очередь payments.new ──▶ consumer
-                                            ▲                    1. шлюз: 2–5 с, 90 % успех
-                                            │ TTL истёк          2. UPDATE статуса
-                          очереди payments.retry.5000 / .10000   3. webhook клиенту
-                                            ▲                        │
-                                            └── ошибка, попытки ещё есть
-                                                                     │ ошибка на 3-й попытке
-                                                                     ▼ или битое сообщение
-                                    exchange payments.dlx ──▶ очередь payments.dlq
+клиент
+  │  POST /api/v1/payments
+  ▼
+ api
+  │  одна транзакция: INSERT в payments и в outbox (PostgreSQL)
+  ▼
+outbox-relay
+  │  SELECT ... FOR UPDATE SKIP LOCKED, publish с подтверждением брокера
+  ▼
+exchange payments ──▶ очередь payments.new ──▶ consumer: шлюз → статус в БД → webhook
+                             ▲                     │
+                             │ TTL истёк           │ ошибка, попытки ещё есть
+               очереди payments.retry.<мс> ◀───────┤
+                                                   │ 3-я ошибка или битое сообщение
+                                                   ▼
+                                        exchange payments.dlx ──▶ очередь payments.dlq
 ```
 
 Из одного образа запускаются три процесса:
@@ -79,6 +79,9 @@ x-request-id: ad33e396-599d-4096-8cd6-7931a952cc93
 {"payment_id":"c10ab690-49f4-48fa-9246-7a87452cd852","status":"pending","created_at":"2026-10-05T14:25:53.013432Z"}
 ```
 
+`webhook-sink` в адресе — имя сервиса в сети compose: webhook отправляет consumer изнутри этой
+сети, поэтому `localhost` здесь не подойдёт.
+
 Тот же запрос ещё раз возвращает тот же платёж и заголовок `Idempotent-Replayed: true`; второй
 платёж и второе событие не создаются.
 
@@ -122,6 +125,15 @@ curl http://localhost:8000/api/v1/payments/c10ab690-49f4-48fa-9246-7a87452cd852 
 Все ошибки приходят в этом формате. `trace_id` берётся из заголовка запроса `X-Request-ID` или
 генерируется и возвращается в том же заголовке ответа.
 
+| Код | `error_code` | Когда |
+| --- | --- | --- |
+| 401 | `INVALID_API_KEY` | нет ключа или он неверный |
+| 404 | `PAYMENT_NOT_FOUND` | платежа с таким id нет |
+| 409 | `IDEMPOTENCY_KEY_CONFLICT` | ключ уже использован с другим телом запроса |
+| 422 | `VALIDATION_ERROR` | невалидное тело или нет `Idempotency-Key`; подробности в `details.errors` |
+| 503 | `SERVICE_UNAVAILABLE` | недоступна база данных; запрос можно повторить с тем же ключом |
+| 500 | `INTERNAL_ERROR` | непредвиденная ошибка; подробности только в логах, по `trace_id` |
+
 Webhook, который получает клиент:
 
 ```
@@ -155,14 +167,15 @@ payment 61e3b90d-...: webhook delivered
 `payments.dlq`:
 
 ```bash
-docker compose exec rabbitmq rabbitmqctl list_queues name messages
+docker compose exec rabbitmq rabbitmqctl -q list_queues name messages
 ```
 
 ```
-payments.new          0
-payments.retry.5000   0
-payments.retry.10000  0
-payments.dlq          1
+name	messages
+payments.new	0
+payments.retry.10000	0
+payments.retry.5000	0
+payments.dlq	1
 ```
 
 У сообщения в DLQ сохраняются заголовки `x-attempt: 3` и `x-last-error` с текстом последней ошибки,
@@ -208,7 +221,9 @@ payments.dlq          1
 - webhook уже доставлен (`webhook_delivered_at`) — повторно не отправляется.
 
 Вызов шлюза выполняется вне транзакции БД, чтобы не держать соединение и блокировки на время
-внешнего запроса.
+внешнего запроса. Обратная сторона: два одновременно обрабатываемых дубля оба дойдут до шлюза.
+Эмулятору это безразлично; с настоящим шлюзом это закрывается ключом идемпотентности в запросе к
+нему (id платежа), тогда повторный вызов не приводит ко второму списанию.
 
 ### «10 % ошибок» шлюза
 
@@ -249,11 +264,17 @@ consumer, поэтому порядок их запуска не важен.
 неисправимой ошибкой (платёж не найден) и сообщения, которые не разбираются в событие — они уходят
 туда сразу, без retry. Туда же уходит сообщение, для которого не удалось опубликовать копию на
 retry: в DLQ оно сохранится для ручного повтора, а возврат в очередь дал бы бесконечную
-мгновенную повторную доставку, пока брокер не принимает публикации. Используется штатный механизм брокера: consumer отклоняет сообщение без
-requeue, очередь `payments.new` отправляет его в `payments.dlx`.
+мгновенную повторную доставку, пока брокер не принимает публикации.
 
-Если в DLQ оказался платёж с недоставленным webhook'ом, его статус в БД уже финальный и доступен
-через `GET`; `webhook_delivered_at` остаётся пустым.
+Используется штатный механизм брокера: consumer отклоняет сообщение без requeue, очередь
+`payments.new` отправляет его в `payments.dlx`.
+
+Что видно по платежу, сообщение которого оказалось в DLQ:
+
+- не доставлен webhook — статус уже финальный и доступен через `GET`, `webhook_delivered_at`
+  пустой;
+- сбой случился раньше записи статуса (например, база была недоступна дольше, чем длятся три
+  попытки) — платёж остаётся `pending`, пока сообщение не вернут из DLQ в `payments.new`.
 
 ### Webhook
 
@@ -302,6 +323,7 @@ uv run pytest tests/unit                      # без инфраструкту�
 TEST_DATABASE_URL=postgresql+asyncpg://payments:payments@localhost:5432/payments_test \
 TEST_RABBITMQ_URL=amqp://guest:guest@localhost:5672/ \
 uv run pytest                                 # всё, нужны запущенные postgres и rabbitmq
+make lint                                     # ruff и mypy --strict
 ```
 
 Что проверяется:

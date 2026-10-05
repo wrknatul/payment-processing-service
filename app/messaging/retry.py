@@ -23,11 +23,12 @@ class RetryPolicy:
         """Delay before the next attempt, or None when `attempt` was the last allowed one."""
         if attempt >= self.max_attempts:
             return None
-        return round(self.base_delay_seconds * self.multiplier ** (attempt - 1) * 1000)
+        return self._delay_ms(attempt)
 
     @property
     def delays_ms(self) -> tuple[int, ...]:
-        return tuple(
-            round(self.base_delay_seconds * self.multiplier ** (attempt - 1) * 1000)
-            for attempt in range(1, self.max_attempts)
-        )
+        """Every delay the policy can produce, shortest first."""
+        return tuple(self._delay_ms(attempt) for attempt in range(1, self.max_attempts))
+
+    def _delay_ms(self, attempt: int) -> int:
+        return round(self.base_delay_seconds * self.multiplier ** (attempt - 1) * 1000)

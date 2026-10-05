@@ -1,11 +1,11 @@
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-PAYMENT_CREATED = "payment.created"
-PAYMENTS_NEW_ROUTING_KEY = "payments.new"
+PAYMENT_CREATED: Final = "payment.created"
+PAYMENTS_NEW_ROUTING_KEY: Final = "payments.new"
 
 
 class PaymentCreatedEvent(BaseModel):

@@ -15,6 +15,7 @@ test:
 lint:
 	uv run ruff check .
 	uv run ruff format --check .
+	uv run mypy
 
 fmt:
 	uv run ruff format .
